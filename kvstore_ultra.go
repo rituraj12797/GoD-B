@@ -54,8 +54,20 @@ type UltraKV struct {
 
 func NewUltraKV(btreePath, walPath string) (*UltraKV, error) {
 	btree := NewBTree()
-	// persisted BtRee loading
-	_ = btree.LoadFromFile(btreePath)
+	// WAL-only recovery: Skip B-Tree loading, rebuild from WAL entirely
+
+	// WHY THIS ?? ===> OPTIMIZATION: B-Tree is empty on startup, so no need to load it from file
+
+	// WE can load btre from ssd and partially replay wal or just simpley full replay wal
+
+	// pros : faster startup, no need to load btree from disk
+
+	// cons : for larger  datasets, WAL replay can be slower than loading a pre-built B-Tree
+
+	
+
+
+
 	walFile, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
@@ -95,6 +107,14 @@ func (kv *UltraKV) Close() {
 	close(kv.closeCh)
 	kv.flusherWG.Wait()
 	kv.walFlusherWG.Wait()
+
+	// Save B-Tree snapshot on clean shutdown (for backup, not recovery)
+	if err := kv.btree.SaveToFile(kv.btreePath); err != nil {
+		// fmt.Printf("[DEBUG] Error saving B-tree snapshot on shutdown: %v\n", err)
+	} else {
+		// fmt.Println("[DEBUG] B-tree snapshot saved on shutdown")
+	}
+
 	kv.walFile.Close()
 }
 
@@ -125,7 +145,7 @@ func (kv *UltraKV) Set(key, value string) {
 		return
 	}
 
- // CRITICAL: WAL MUST be written BEFORE operation for ACID compliance
+	// CRITICAL: WAL MUST be written BEFORE operation for ACID compliance
 	kv.writeWAL("SET", key, value)
 
 	// update cache immediately for read performance
@@ -183,7 +203,7 @@ func (kv *UltraKV) Del(key string) {
 	delete(kv.cache, key)
 	kv.cacheLock.Unlock()
 
-	// send to batched B-tree writer 
+	// send to batched B-tree writer
 	kv.writeCh <- WriteOp{OpType: "del", Key: key}
 }
 
@@ -218,7 +238,7 @@ func (kv *UltraKV) Commit() {
 			delete(kv.cache, op.Key)
 			kv.cacheLock.Unlock()
 		}
-		// send to batched B-tree writer 
+		// send to batched B-tree writer
 		kv.writeCh <- op
 	}
 	kv.flushCh <- struct{}{} // force flush
@@ -260,7 +280,7 @@ func (kv *UltraKV) writeWAL(op, key, value string) {
 	}
 	kv.walBufferMutex.Unlock()
 
-	// fmt.Printf("[DEBUG] WAL: %s", line) 
+	// fmt.Printf("[DEBUG] WAL: %s", line)
 }
 
 func (kv *UltraKV) swapWALBuffers() {
@@ -307,18 +327,20 @@ func (kv *UltraKV) flushWALBuffer() {
 	}
 }
 
+// persist() - Now only used for backup snapshots, not for recovery
 func (kv *UltraKV) persist() {
 	if err := kv.btree.SaveToFile(kv.btreePath); err != nil {
-		// fmt.Printf("[DEBUG] Error persisting B-tree: %v\n", err) // [DEBUG]
+		// fmt.Printf("[DEBUG] Error persisting B-tree snapshot: %v\n", err) // [DEBUG]
 	} else {
-		// fmt.Println("[DEBUG] B-tree persisted") // [DEBUG]
+		// fmt.Println("[DEBUG] B-tree snapshot saved") // [DEBUG]
 	}
 }
 
+// replayWAL - WAL-only recovery: replay entire WAL from beginning to rebuild B-Tree
 func (kv *UltraKV) replayWAL() error {
 	f, err := os.Open(kv.walPath)
 	if err != nil {
-		return nil 
+		return nil
 	}
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
@@ -378,7 +400,7 @@ func (kv *UltraKV) writeFlusher() {
 			keys = append(keys, op.Key)
 		}
 
-		// wal written immediately, so we can safely batch updates
+		// WAL written immediately, so we can safely batch updates to in-memory B-Tree
 		kv.lock.Lock()
 		for _, op := range batch {
 			if op.OpType == "set" {
@@ -387,8 +409,8 @@ func (kv *UltraKV) writeFlusher() {
 				kv.btree.Delete([]byte(op.Key))
 			}
 		}
-		// persist 
-		kv.persist()
+		// REMOVED: B-Tree persistence during operations for better performance
+		// kv.persist() // Only persist on shutdown, not during operations
 		batch = batch[:0]
 		kv.lock.Unlock()
 	}
